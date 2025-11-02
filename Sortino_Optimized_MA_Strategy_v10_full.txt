@@ -1,0 +1,540 @@
+// @version=5
+// ============================================================================
+// Sortino Optimized MA Strategy v10 (Final+Fix) — Full Replacement
+// NOTE: 변경 로그는 파일 외부(채팅)로 제공됩니다. 본 파일은 풀버전 코드만 포함합니다.
+// ============================================================================
+
+strategy(
+     title="Sortino Optimized MA Strategy v10 (Final+Fix)",
+     overlay=true,
+     initial_capital=10000,
+     commission_type=strategy.commission.percent,
+     commission_value=0.075,
+     pyramiding=0,                      // 중복 진입 금지 (단일 포지션)
+     process_orders_on_close=true,
+     calc_on_every_tick=false,
+     calc_on_order_fills=true
+)
+
+// ============================================================================
+// 1) 입력값
+// ============================================================================
+
+// --- 1. Base MA Inputs (MA Finder Logic)
+string g_ma = "1. MA Finder Logic (Entry 1 / Exit 1)"
+i_useMAEntry = input.bool(true,  "[토글 E-1] MA Crossover 진입 사용", group=g_ma)
+i_useMAExit  = input.bool(true,  "[토글 X-1] MA Crossunder 청산 사용", group=g_ma)
+i_maLength   = input.int(120,    "Base MA Length (최적 MA 길이)", minval=1, group=g_ma)
+i_maType     = input.string("EMA", "Base MA Type (MA 종류)", options=["EMA","SMA"], group=g_ma)
+
+// --- 2. VB & Supertrend Inputs
+string g_vb_st = "2. VB & Supertrend Logic (Entry 2 / Exit 2)"
+i_useVBEntry    = input.bool(false, "[토글 E-2] Volatility Breakout(VB) 진입 사용", group=g_vb_st)
+k_factor        = input.float(0.5,   "└ K 팩터 (K-Factor)", step=0.1, minval=0.1, maxval=2.0, group=g_vb_st)
+i_useSupertrendExit = input.bool(true, "[토글 X-2] Supertrend Flip 청산 사용", group=g_vb_st)
+atrLength       = input.int(14,      "└ ATR 기간 (ATR Length)", minval=1, group=g_vb_st)
+atrMultiplier   = input.float(3.0,   "└ ATR 승수 (ATR Multiplier)", step=0.1, minval=0.1, group=g_vb_st)
+
+// --- 3. General Filters (Aggregated Scores Logic)
+string g_filters = "3. General Filters (For ALL Entries / Exit 3)"
+i_useStabilityFilter = input.bool(true, "[필터 1] Stability Filter 사용 (표 2)", group=g_filters)
+i_stabilityMaLength  = input.int(200,  "└ Stability MA Length (장기 MA)", minval=1, group=g_filters)
+
+i_useOscillatorFilter = input.bool(true, "[필터 2] Oscillator Neutral Zone Filter 사용 (표 3)", group=g_filters)
+i_rsiLength = input.int(14, "└ Oscillator(RSI) Length", group=g_filters)
+i_obLevel   = input.int(70, "└ 과매수(Overbought) 레벨", group=g_filters)
+i_osLevel   = input.int(30, "└ 과매도(Oversold) 레벨", group=g_filters)
+
+i_useOverboughtExit = input.bool(true, "[토글 X-3] Overbought Profit-Taking 청산 사용 (4.2.2)", group=g_filters)
+
+// --- 4. 신규 청산 로직 (Fixed Stop & Trailing/BE/TP)
+string g_exit_new = "4. 신규 청산 로직 (Exit 4)"
+i_useFixedStop   = input.bool(false, "[토글 X-4] 고정 % 손절 사용", group=g_exit_new)
+i_fixedStopPct   = input.float(3.0,  "└ 고정 손절 %", minval=0.1, group=g_exit_new)
+
+i_useBE          = input.bool(false, "[토글] Break-Even(손익분기) 이동", group=g_exit_new)
+i_beTriggerPct   = input.float(1.0,  "└ BE 트리거 % (진입가 대비 상승분)", minval=0.1, group=g_exit_new)
+
+i_useATRTrailing = input.bool(false, "[토글] ATR 트레일링 스탑", group=g_exit_new)
+i_atrTrailMult   = input.float(2.0,  "└ ATR 트레일 배수", step=0.1, minval=0.1, group=g_exit_new)
+
+i_useSTTrailing  = input.bool(false, "[토글] Supertrend 라인 트레일링", group=g_exit_new)
+
+i_useTP1         = input.bool(false, "[토글] TP1 단일 익절 (전량)", group=g_exit_new)
+i_tp1Pct         = input.float(2.0,  "└ TP1 %", minval=0.1, group=g_exit_new)
+i_useTP2         = input.bool(false, "[토글] TP2 단일 익절 (전량)", group=g_exit_new)
+i_tp2Pct         = input.float(4.0,  "└ TP2 %", minval=0.1, group=g_exit_new)
+
+// --- 5. 리스크 & 사이징 (Leverage, Wallet)
+string g_risk = "5. 리스크 & 사이징 (Leverage, Wallet)"
+i_leverage          = input.float(10.0, "레버리지", minval=1.0, maxval=100.0, group=g_risk, inline="R1")
+i_baseQtyPercent    = input.float(25.0, "기본 포지션 % (자본 대비)", minval=0.1, group=g_risk, inline="R1")
+
+i_useWallet             = input.bool(true,  "월렛 시스템 사용", group=g_risk, inline="R2")
+i_applyReserveToSizing  = input.bool(true,  "└ 적립금 사이징 반영", group=g_risk, inline="R2")
+i_profitReservePct_raw  = input.float(10.0, "└ 적립 비율 %", minval=0.0, maxval=100.0, group=g_risk, inline="R3")
+i_minTradableCapital    = input.float(1000.0, "최소 거래 자본", minval=0.0, group=g_risk, inline="R3")
+i_useDrawdownScaling    = input.bool(true,  "드로우다운 축소", group=g_risk, inline="R4")
+i_drawdownTriggerPct    = input.float(10.0, "└ 드로우다운 트리거 %", minval=0.0, group=g_risk, inline="R5")
+i_drawdownRiskScale     = input.float(0.8,  "└ 드로우다운 리스크 배율", minval=0.0, group=g_risk, inline="R5")
+i_profitReservePct      = i_profitReservePct_raw * 0.01
+
+// --- 6. 백테스트 기간 (인풋 변경 시 즉시 반영되도록 var 사용 금지)
+string g_period = "6. 백테스트 기간 (시작일)"
+i_startYear  = input.int(2020, "시작 연도", group=g_period, inline="S")
+i_startMonth = input.int(1,    "시작 월",   minval=1, maxval=12, group=g_period, inline="S")
+i_startDay   = input.int(1,    "시작 일",   minval=1, maxval=31, group=g_period, inline="S")
+startTime    = timestamp(i_startYear, i_startMonth, i_startDay, 0, 0)
+
+// --- 7. 세션(시간) 필터
+string g_session = "7. 세션(시간) 필터"
+i_useSessionFilter = input.bool(false, "[토글 F-1] 세션(시간) 필터 사용", group=g_session, inline="A")
+i_sessionTimezoneChoice = input.string("Exchange", "세션 타임존", options=["Exchange","Asia/Seoul","UTC"], group=g_session, inline="A")
+i_sessionStrInput = input.session("0900-1600", "세션 시간 (HHMM-HHMM)", group=g_session, inline="B")
+
+// --- 8. 3Commas 알림
+string g_alerts = "8. 3Commas 알림"
+i_useAlerts           = input.bool(true,  "[토글 A-1] 자동화 알림(alert()) 사용", group=g_alerts, inline="A")
+i_useAlertConditions  = input.bool(true,  "[토글 A-2] UI 팝업 알림(alertcondition()) 사용", group=g_alerts, inline="A")
+i_alertToken          = input.string("YOUR_SECRET_TOKEN", "보안 토큰 (JSON용)", group=g_alerts, inline="B")
+
+// --- 9. 시각화
+string g_viz = "9. 시각화 (Plots)"
+i_showEntryMarkers = input.bool(true, "[토글 V-1] 진입/청산 마커 표시", group=g_viz)
+i_showTable        = input.bool(true, "[토글 V-2] 성능/HUD 테이블 표시", group=g_viz)
+
+// --- 10. 포지션 방향 토글
+string g_side = "10. 포지션 방향"
+i_enableLong  = input.bool(true,  "롱 사용", group=g_side, inline="SD")
+i_enableShort = input.bool(false, "숏 사용", group=g_side, inline="SD")
+
+// --- 11. Sortino 설정
+string g_sortino = "11. Sortino 설정"
+i_sortinoLen      = input.int(500, "Sortino 계산 길이(바 수)", minval=2, group=g_sortino)
+i_sortinoMAR      = input.float(0.0, "MAR (바당 최소 기대수익률, 0=무위험)", group=g_sortino)
+i_sortinoAnnualize= input.bool(false, "연율화(정보용)", group=g_sortino)
+i_barsPerYear     = input.int(365*24*60, "연간 바 수(1분봉=525,600)", minval=1, group=g_sortino) // 프레임별로 조정
+
+// --- 12. 일일 손실 한도/쿨다운
+string g_guard = "12. 가드: 일일 손실/쿨다운"
+i_useDailyLossGuard  = input.bool(false, "[토글] 일일 손실 한도 가드", group=g_guard, inline="G1")
+i_dailyLossLimitPct  = input.float(5.0,  "└ 일일 손실 한도 %", minval=0.1, group=g_guard, inline="G1")
+i_dailyResetAtSession= input.bool(true,  "└ 매일 00:00(차트시간) 리셋", group=g_guard)
+
+// ============================================================================
+// 2) 상태 변수
+// ============================================================================
+
+var float tradableCapital     = strategy.initial_capital
+var float peakEquity          = strategy.initial_capital
+var float withdrawable        = 0.0
+
+var float fixedStopPriceLong  = na
+var float fixedStopPriceShort = na
+
+var bool  guardFrozen         = false          // 최소 자본 가드
+var bool  guardDailyLoss      = false          // 일일 손실 가드
+
+// 일일 손실 계산 보조 변수
+var int   prevD               = na
+var float dayStartEquity      = strategy.initial_capital
+
+// HUD 테이블
+var table hud = na
+
+// ============================================================================
+// 3) 헬퍼 함수
+// ============================================================================
+
+f_getMA(len, type) =>
+    float ma = 0.0
+    ma := type == "EMA" ? ta.ema(close, len) : ta.sma(close, len)
+    ma
+
+// 고정 손절가(롱/숏)
+calcFixedStopPriceLong(entryPrice) =>
+    float stopPrice = na
+    if i_useFixedStop and i_fixedStopPct > 0
+        stopPrice := entryPrice * (1 - i_fixedStopPct / 100.0)
+    stopPrice
+
+calcFixedStopPriceShort(entryPrice) =>
+    float stopPrice = na
+    if i_useFixedStop and i_fixedStopPct > 0
+        stopPrice := entryPrice * (1 + i_fixedStopPct / 100.0)
+    stopPrice
+
+// 주문 수량 계산
+calcOrderSize(price, riskMult) =>
+    float result = 0.0
+    if price > 0
+        float effectiveScale = i_baseQtyPercent
+        if i_useDrawdownScaling and peakEquity > 0
+            float dd = (peakEquity - strategy.equity) / peakEquity * 100.0
+            if dd > i_drawdownTriggerPct
+                effectiveScale *= i_drawdownRiskScale
+
+        float pctToUse = math.max(effectiveScale * riskMult, 0.0)
+        float capitalPortion = tradableCapital * pctToUse / 100.0
+        result := (capitalPortion * i_leverage) / price
+    result
+
+// 세션 타임존 처리
+f_resolve_tz(choice) =>
+    string tz = choice == 'Exchange' ? syminfo.timezone : (choice == 'UTC' ? 'Etc/UTC' : 'Asia/Seoul')
+    tz
+
+// ============================================================================
+// 4) 매 바 계산 블록 (월렛/에쿼티/가드/세션)
+// ============================================================================
+
+if barstate.isconfirmed
+    // 4-1) 적립(수익 발생 시)
+    profitDelta = strategy.netprofit - nz(strategy.netprofit[1])
+    if i_useWallet and profitDelta > 0
+        withdrawable += profitDelta * i_profitReservePct
+        // 과도 차감 방지(상한) - 에쿼티의 90%를 넘지 않도록
+        withdrawable := math.min(withdrawable, strategy.equity * 0.90)
+
+    // 4-2) 거래 가능 자본(월렛 반영)
+    equity = strategy.equity
+    effectiveEquity = (i_useWallet and i_applyReserveToSizing) ? (equity - withdrawable) : equity
+    tradableCapital := math.max(effectiveEquity, 0.01)
+
+    // 4-3) 피크 에쿼티 갱신
+    peakEquity := math.max(peakEquity, equity)
+
+    // 4-4) 최소 자본 가드
+    guardFrozen := tradableCapital < i_minTradableCapital
+
+    // 4-5) 일일 손실 가드
+    curD = dayofmonth
+    isNewDay = curD != nz(prevD)
+    if isNewDay
+        dayStartEquity := equity
+        guardDailyLoss := false
+    prevD := curD
+
+    dailyDDPct = dayStartEquity > 0 ? (dayStartEquity - equity) / dayStartEquity * 100.0 : 0.0
+    if i_useDailyLossGuard and dailyDDPct >= i_dailyLossLimitPct
+        guardDailyLoss := true
+
+// 세션 필터
+resolvedSessionTz = f_resolve_tz(i_sessionTimezoneChoice)
+inSessionNow = i_useSessionFilter ? (not na(time(timeframe.period, i_sessionStrInput, resolvedSessionTz))) : true
+
+// ============================================================================
+// 5) 인디케이터 계산
+// ============================================================================
+
+baseMA      = f_getMA(i_maLength, i_maType)
+stabilityMA = f_getMA(i_stabilityMaLength, i_maType)
+
+// [v10 FIX] Supertrend 튜플 연산자 사용 (:=)
+[supertrend, st_dir] = ta.supertrend(atrMultiplier, atrLength)
+isUptrend_ST   = st_dir[1] > 0
+isDowntrend_ST = st_dir[1] < 0
+
+rsi = ta.rsi(close, i_rsiLength)
+
+// VB 엔트리 가격 (NA 방어)
+prevRange  = nz(high[1] - low[1], tr)
+entryPriceLong  = open + prevRange * k_factor
+entryPriceShort = open - prevRange * k_factor
+
+// ============================================================================
+// 6) 신호 정의
+// ============================================================================
+
+// 롱 엔트리/익절 신호
+baseLongEntrySignal  = ta.crossover(close, baseMA)
+baseLongExitSignal   = ta.crossunder(close, baseMA)
+supertrendExitLong   = ta.crossunder(close, supertrend)
+overboughtExitLong   = ta.crossunder(rsi, i_obLevel)
+
+// 숏 엔트리/익절 신호
+baseShortEntrySignal = ta.crossunder(close, baseMA)
+baseShortExitSignal  = ta.crossover(close, baseMA)
+supertrendExitShort  = ta.crossover(close, supertrend)   // 숏일 때 ST 위로 전환 시 청산
+oversoldExitShort    = ta.crossunder(i_osLevel, rsi)     // 과매도 해제 → 청산(선택)
+
+// 고정 손절 트리거
+fixedStopHitLong  = not na(fixedStopPriceLong)  and low  <= fixedStopPriceLong
+fixedStopHitShort = not na(fixedStopPriceShort) and high >= fixedStopPriceShort
+
+// 필터 조건
+stabilityFilter = (not i_useStabilityFilter) or (baseMA > stabilityMA)
+stabilityFilterShort = (not i_useStabilityFilter) or (baseMA < stabilityMA)
+
+isOverbought = rsi > i_obLevel
+isOversold   = rsi < i_osLevel
+neutralZoneFilter = (not i_useOscillatorFilter) or (not isOverbought and not isOversold)
+
+// 공통 진입 필터
+commonFiltersLong  = stabilityFilter and neutralZoneFilter and (time >= startTime) and inSessionNow and (not guardFrozen) and (not guardDailyLoss)
+commonFiltersShort = stabilityFilterShort and neutralZoneFilter and (time >= startTime) and inSessionNow and (not guardFrozen) and (not guardDailyLoss)
+
+// ============================================================================
+// 7) 엔트리/청산 실행 (단일 우선순위 체인, 봉당 1회)
+// ============================================================================
+
+var bool entrySignalFired = false
+var bool exitSignalFired  = false
+var string lastEntrySide  = ""     // "long" / "short"
+var string exitReason     = ""
+var string alertEntryMsg  = ""
+var string alertExitMsg   = ""
+var bool enteredThisBar   = false
+
+entrySignalFired := false
+exitSignalFired  := false
+enteredThisBar   := false
+exitReason       := ""
+alertEntryMsg    := ""
+alertExitMsg     := ""
+
+// 포지션 상태
+posSize     = strategy.position_size
+posIsLong   = posSize > 0
+posIsShort  = posSize < 0
+posAvgPrice = strategy.position_avg_price
+
+// --- 엔트리 우선순위: (1) VB → (2) MA ---
+// 롱
+if not enteredThisBar and i_enableLong and posSize == 0 and commonFiltersLong
+    if i_useVBEntry and isUptrend_ST
+        qty = calcOrderSize(entryPriceLong, 1.0)
+        if qty > 0
+            strategy.entry("L-VB", strategy.long, qty=qty, stop=entryPriceLong, comment="VB Long")
+            entrySignalFired := true
+            lastEntrySide := "long"
+            enteredThisBar := true
+            // 초기 고정 손절 세팅은 포지션 체결 이후(아래 7-3에서)
+            // 알림(JSON)
+            alertEntryMsg := str.format('{{"token":"{0}","action":"buy","ticker":"{1}","qty":"{2}","price":"{3}","side":"{4}","leverage":"{5}","time":"{6}"}}',
+                i_alertToken, syminfo.tickerid, str.tostring(qty), str.tostring(entryPriceLong), "long", str.tostring(i_leverage), str.tostring(time))
+
+    else if i_useMAEntry and baseLongEntrySignal
+        qty = calcOrderSize(close, 1.0)
+        if qty > 0
+            strategy.entry("L-MA", strategy.long, qty=qty, comment="MA Long")
+            entrySignalFired := true
+            lastEntrySide := "long"
+            enteredThisBar := true
+            alertEntryMsg := str.format('{{"token":"{0}","action":"buy","ticker":"{1}","qty":"{2}","price":"{3}","side":"{4}","leverage":"{5}","time":"{6}"}}',
+                i_alertToken, syminfo.tickerid, str.tostring(qty), str.tostring(close), "long", str.tostring(i_leverage), str.tostring(time))
+
+// 숏
+if not enteredThisBar and i_enableShort and posSize == 0 and commonFiltersShort
+    if i_useVBEntry and isDowntrend_ST
+        qtyS = calcOrderSize(entryPriceShort, 1.0)
+        if qtyS > 0
+            strategy.entry("S-VB", strategy.short, qty=qtyS, stop=entryPriceShort, comment="VB Short")
+            entrySignalFired := true
+            lastEntrySide := "short"
+            enteredThisBar := true
+            alertEntryMsg := str.format('{{"token":"{0}","action":"sell","ticker":"{1}","qty":"{2}","price":"{3}","side":"{4}","leverage":"{5}","time":"{6}"}}',
+                i_alertToken, syminfo.tickerid, str.tostring(qtyS), str.tostring(entryPriceShort), "short", str.tostring(i_leverage), str.tostring(time))
+
+    else if i_useMAEntry and baseShortEntrySignal
+        qtyS = calcOrderSize(close, 1.0)
+        if qtyS > 0
+            strategy.entry("S-MA", strategy.short, qty=qtyS, comment="MA Short")
+            entrySignalFired := true
+            lastEntrySide := "short"
+            enteredThisBar := true
+            alertEntryMsg := str.format('{{"token":"{0}","action":"sell","ticker":"{1}","qty":"{2}","price":"{3}","side":"{4}","leverage":"{5}","time":"{6}"}}',
+                i_alertToken, syminfo.tickerid, str.tostring(qtyS), str.tostring(close), "short", str.tostring(i_leverage), str.tostring(time))
+
+// --- 7-2) 신호 기반 청산 (포지션 있었을 때만)
+if posIsLong or posIsShort
+    // 롱 포지션 청산 판단
+    if posIsLong
+        if i_useMAExit and baseLongExitSignal
+            exitSignalFired := true
+            exitReason := "MA Crossunder Exit (Long)"
+        else if i_useSupertrendExit and supertrendExitLong
+            exitSignalFired := true
+            exitReason := "Supertrend Flip Exit (Long)"
+        else if i_useOverboughtExit and ta.crossunder(rsi, i_obLevel)
+            exitSignalFired := true
+            exitReason := "Overbought Profit-Take (Long)"
+        else if fixedStopHitLong
+            exitSignalFired := true
+            exitReason := "Fixed/Trailing Stop Hit (Long)"
+
+        // TP1/TP2
+        if not exitSignalFired and i_useTP2 and posAvgPrice > 0 and high >= posAvgPrice * (1 + i_tp2Pct/100.0)
+            exitSignalFired := true
+            exitReason := "TP2 Hit (Long)"
+        if not exitSignalFired and i_useTP1 and posAvgPrice > 0 and high >= posAvgPrice * (1 + i_tp1Pct/100.0)
+            exitSignalFired := true
+            exitReason := "TP1 Hit (Long)"
+
+    // 숏 포지션 청산 판단
+    if posIsShort
+        if i_useMAExit and baseShortExitSignal
+            exitSignalFired := true
+            exitReason := "MA Crossover Exit (Short)"
+        else if i_useSupertrendExit and supertrendExitShort
+            exitSignalFired := true
+            exitReason := "Supertrend Flip Exit (Short)"
+        else if i_useOverboughtExit and ta.crossunder(i_osLevel, rsi) // 과매도 해제
+            exitSignalFired := true
+            exitReason := "Oversold Exit (Short)"
+        else if fixedStopHitShort
+            exitSignalFired := true
+            exitReason := "Fixed/Trailing Stop Hit (Short)"
+
+        // TP1/TP2 (숏)
+        if not exitSignalFired and i_useTP2 and posAvgPrice > 0 and low <= posAvgPrice * (1 - i_tp2Pct/100.0)
+            exitSignalFired := true
+            exitReason := "TP2 Hit (Short)"
+        if not exitSignalFired and i_useTP1 and posAvgPrice > 0 and low <= posAvgPrice * (1 - i_tp1Pct/100.0)
+            exitSignalFired := true
+            exitReason := "TP1 Hit (Short)"
+
+    // 실행
+    if exitSignalFired
+        strategy.close_all()
+        alertExitMsg := str.format('{{"token":"{0}","action":"close","ticker":"{1}","reason":"{2}","time":"{3}"}}',
+            i_alertToken, syminfo.tickerid, exitReason, str.tostring(time))
+
+// --- 7-3) 포지션 체결 직후/청산 직후의 스톱/트레일 가격 관리
+// 포지션 종료 -> 스톱 리셋
+if posSize == 0 and nz(posSize[1]) != 0
+    fixedStopPriceLong  := na
+    fixedStopPriceShort := na
+
+// 포지션 신규 진입 -> 초기 손절가 설정
+if posSize != 0 and nz(posSize[1]) == 0
+    if posIsLong and i_useFixedStop
+        fixedStopPriceLong := calcFixedStopPriceLong(strategy.position_avg_price)
+    if posIsShort and i_useFixedStop
+        fixedStopPriceShort := calcFixedStopPriceShort(strategy.position_avg_price)
+
+// 트레일링/BE 동적 업데이트 (포지션 유지 중)
+curATR = ta.atr(atrLength)
+if posIsLong
+    // BE
+    if i_useBE and posAvgPrice > 0 and high >= posAvgPrice * (1 + i_beTriggerPct/100.0)
+        fixedStopPriceLong := na(fixedStopPriceLong) ? posAvgPrice : math.max(fixedStopPriceLong, posAvgPrice)
+    // ATR 트레일
+    if i_useATRTrailing
+        trail = close - curATR * i_atrTrailMult
+        fixedStopPriceLong := na(fixedStopPriceLong) ? trail : math.max(fixedStopPriceLong, trail)
+    // ST 트레일
+    if i_useSTTrailing
+        fixedStopPriceLong := na(fixedStopPriceLong) ? supertrend : math.max(fixedStopPriceLong, supertrend)
+
+if posIsShort
+    if i_useBE and posAvgPrice > 0 and low <= posAvgPrice * (1 - i_beTriggerPct/100.0)
+        fixedStopPriceShort := na(fixedStopPriceShort) ? posAvgPrice : math.min(fixedStopPriceShort, posAvgPrice)
+    if i_useATRTrailing
+        trailS = close + curATR * i_atrTrailMult
+        fixedStopPriceShort := na(fixedStopPriceShort) ? trailS : math.min(fixedStopPriceShort, trailS)
+    if i_useSTTrailing
+        fixedStopPriceShort := na(fixedStopPriceShort) ? supertrend : math.min(fixedStopPriceShort, supertrend)
+
+// ============================================================================
+// 8) Sortino 계산 (에쿼티 수익률 기반)
+// ============================================================================
+
+// 바 수익률 (에쿼티 기준)
+ret = nz(strategy.equity / nz(strategy.equity[1], strategy.initial_capital) - 1, 0.0)
+// 다운사이드 편차 계산: (min(0, ret - MAR))^2 평균의 제곱근
+down = math.min(0.0, ret - i_sortinoMAR)
+down2 = down * down
+downVar = ta.sma(down2, i_sortinoLen)
+downDev = math.sqrt(nz(downVar, 0.0))
+
+avgExcess = ta.sma(ret - i_sortinoMAR, i_sortinoLen)
+sortinoRaw = downDev > 0 ? avgExcess / downDev : na
+// 연율화(정보용): 평균 수익률*연간바수 / 다운사이드표준편차*sqrt(연간바수)
+sortinoAnn = na
+if i_sortinoAnnualize
+    avgR = ta.sma(ret, i_sortinoLen)
+    annMu = avgR * i_barsPerYear
+    annDen = downDev * math.sqrt(i_barsPerYear)
+    sortinoAnn := annDen > 0 ? annMu / annDen : na
+
+// ============================================================================
+// 9) 시각화
+// ============================================================================
+
+plot(baseMA,      title="Base MA (Finder)", color=color.new(color.blue, 0), linewidth=2)
+plot(i_useStabilityFilter ? stabilityMA : na, title="Stability MA", color=color.new(color.gray, 50), linewidth=1, style=plot.style_dotted)
+
+stColor = st_dir > 0 ? color.new(color.green, 0) : color.new(color.red, 0)
+plot(i_useSupertrendExit ? supertrend : na, title="Supertrend (Exit Line)", color=stColor, linewidth=2)
+
+showVBLong  = i_useVBEntry and isUptrend_ST  and posSize == 0 and commonFiltersLong
+showVBShort = i_useVBEntry and isDowntrend_ST and posSize == 0 and commonFiltersShort
+plot(showVBLong  ? entryPriceLong  : na, title="VB Long Entry Target",  color=color.new(color.orange, 0), style=plot.style_cross, linewidth=2)
+plot(showVBShort ? entryPriceShort : na, title="VB Short Entry Target", color=color.new(color.orange, 0), style=plot.style_cross, linewidth=2)
+
+plot(fixedStopPriceLong,  title="Fixed/Trail Stop (Long)",  color=color.new(color.maroon, 0), style=plot.style_linebr, linewidth=2)
+plot(fixedStopPriceShort, title="Fixed/Trail Stop (Short)", color=color.new(color.purple, 0), style=plot.style_linebr, linewidth=2)
+
+// 진입/청산 마커
+plotshape(i_showEntryMarkers and entrySignalFired and lastEntrySide=="long"  ? low  : na, title="Long Entry Marker",  location=location.belowbar, color=color.new(color.green, 0), style=shape.triangleup,   size=size.small, text="진입")
+plotshape(i_showEntryMarkers and entrySignalFired and lastEntrySide=="short" ? high : na, title="Short Entry Marker", location=location.abovebar, color=color.new(color.teal, 0),  style=shape.triangledown, size=size.small, text="진입")
+plotshape(i_showEntryMarkers and exitSignalFired ? high : na, title="Exit Marker", location=location.abovebar, color=color.new(color.red, 0), style=shape.triangledown, size=size.tiny, text="청산")
+
+// 가드 배경
+bgcolor(guardFrozen    ? color.new(color.red, 90)   : na, title="Guard: Min Capital Freeze")
+bgcolor(guardDailyLoss ? color.new(color.orange,90) : na, title="Guard: Daily Loss Freeze")
+
+// HUD 테이블
+if i_showTable
+    if na(hud)
+        hud := table.new(position.top_right, 4, 6, border_width=1)
+    table.cell(hud, 0, 0, "Sortino (Raw)", text_color=color.white)
+    table.cell(hud, 1, 0, str.tostring(sortinoRaw, format.mintick))
+    table.cell(hud, 2, 0, "Sortino (Ann)", text_color=color.white)
+    table.cell(hud, 3, 0, str.tostring(sortinoAnn, format.mintick))
+
+    table.cell(hud, 0, 1, "Equity", text_color=color.white)
+    table.cell(hud, 1, 1, str.tostring(strategy.equity, format.mintick))
+    table.cell(hud, 2, 1, "Tradable", text_color=color.white)
+    table.cell(hud, 3, 1, str.tostring(tradableCapital, format.mintick))
+
+    table.cell(hud, 0, 2, "Withdrawable", text_color=color.white)
+    table.cell(hud, 1, 2, str.tostring(withdrawable, format.mintick))
+    ddNow = peakEquity > 0 ? (peakEquity - strategy.equity) / peakEquity * 100.0 : na
+    table.cell(hud, 2, 2, "DD % (Peak)", text_color=color.white)
+    table.cell(hud, 3, 2, str.tostring(ddNow, format.mintick))
+
+    table.cell(hud, 0, 3, "Daily DD %", text_color=color.white)
+    table.cell(hud, 1, 3, str.tostring(dailyDDPct, format.mintick))
+    table.cell(hud, 2, 3, "Daily Guard", text_color=color.white)
+    table.cell(hud, 3, 3, guardDailyLoss ? "ON" : "OFF")
+
+    table.cell(hud, 0, 4, "MinCap Guard", text_color=color.white)
+    table.cell(hud, 1, 4, guardFrozen ? "ON" : "OFF")
+    table.cell(hud, 2, 4, "ST Dir", text_color=color.white)
+    table.cell(hud, 3, 4, st_dir > 0 ? "UP" : "DOWN")
+
+    table.cell(hud, 0, 5, "Pos", text_color=color.white)
+    table.cell(hud, 1, 5, posIsLong ? "LONG" : (posIsShort ? "SHORT" : "-"))
+    table.cell(hud, 2, 5, "AvgPx", text_color=color.white)
+    table.cell(hud, 3, 5, posAvgPrice > 0 ? str.tostring(posAvgPrice, format.mintick) : "-")
+
+// ============================================================================
+// 10) 알림
+// ============================================================================
+
+// alert(): 동적 JSON 발송
+if i_useAlerts and barstate.isconfirmed
+    if entrySignalFired and alertEntryMsg != ""
+        alert(alertEntryMsg, freq=alert.freq_once_per_bar)
+    if exitSignalFired and alertExitMsg != ""
+        alert(alertExitMsg,  freq=alert.freq_once_per_bar_close)
+
+// alertcondition(): 수동 팝업용(메시지는 상수 문자열만 허용)
+if i_useAlertConditions
+    alertcondition(true, "[v10] 수동 알림 — 차트 조건 충족 시 사용", "이 메시지는 수동 팝업 알림 템플릿입니다.")
+    alertcondition(entrySignalFired, "[v10] 엔트리 트리거", "엔트리 조건 발생(세부 JSON은 alert() 참조)")
+    alertcondition(exitSignalFired,  "[v10] 청산 트리거",  "청산 조건 발생(세부 JSON은 alert() 참조)")
+    guardActivated = (guardFrozen and not nz(guardFrozen[1])) or (guardDailyLoss and not nz(guardDailyLoss[1]))
+    alertcondition(guardActivated, "[v10] 리스크 가드 발동", "가드가 활성화되었습니다.")
